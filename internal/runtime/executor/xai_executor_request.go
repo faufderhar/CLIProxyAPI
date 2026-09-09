@@ -11,11 +11,13 @@ import (
 
 	"github.com/google/uuid"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
+	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -167,6 +169,95 @@ func (e *XAIExecutor) recordXAIRequest(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+}
+
+// diagnoseXAIPrefix reports how much of the upstream prompt prefix this request
+// reuses from the previous turn of the same session, and the first segment where
+// it diverges. Gated on xai.prefix-diagnostics because the chain hashes every
+// input item on every request.
+func (e *XAIExecutor) diagnoseXAIPrefix(ctx context.Context, prepared *xaiPreparedRequest, body []byte) {
+	if e.cfg == nil || !e.cfg.XAI.PrefixDiagnostics || prepared == nil {
+		return
+	}
+	scope := prepared.replayScope
+	if !scope.valid() {
+		return
+	}
+	chain := helps.BuildResponsesPrefixChain(body)
+	if chain.Len() == 0 {
+		return
+	}
+	// The upstream prompt_cache_key is logged on every line: when it rotates
+	// turn to turn, the provider caches under a fresh namespace and no amount of
+	// prefix stability on our side can produce a hit.
+	session := truncateXAIDiagnosticValue(scope.sessionKey)
+	promptCacheKey := truncateXAIDiagnosticValue(chain.PromptCacheKey)
+
+	previous, ok := internalcache.LoadXAIPrefixChain(scope.modelName, scope.sessionKey)
+	internalcache.StoreXAIPrefixChain(scope.modelName, scope.sessionKey, chain)
+	if !ok {
+		helps.LogWithRequestID(ctx).Debugf("xai: prefix baseline | session=%s pck=%s model=%s segments=%d",
+			session, promptCacheKey, scope.modelName, chain.Len())
+		return
+	}
+
+	reused := helps.ComparePrefixChains(previous, chain)
+	reuseRatio := xaiPrefixReuseRatio(reused, chain.Len())
+	if reused >= previous.Len() {
+		helps.LogWithRequestID(ctx).Debugf("xai: prefix extended | session=%s pck=%s model=%s reused=%d/%d (%.1f%%)",
+			session, promptCacheKey, scope.modelName, reused, chain.Len(), reuseRatio)
+		return
+	}
+
+	reason := helps.ClassifyPrefixDrift(previous, chain, reused)
+	helps.LogWithRequestID(ctx).Infof(
+		"xai: prefix drift | session=%s pck=%s model=%s reused=%d/%d (%.1f%%) first_divergence=%s prev=%s now=%s reason=%s",
+		session, promptCacheKey, scope.modelName, reused, chain.Len(), reuseRatio,
+		helps.PrefixSegmentLabel(chain, reused),
+		helps.PrefixSegmentKind(previous, reused),
+		helps.PrefixSegmentKind(chain, reused),
+		reason,
+	)
+}
+
+// logXAIPromptCacheUsage reports the upstream prompt-cache hit rate for one
+// request. The management panel only aggregates these numbers, so this line is
+// what attributes a drop to a specific session, credential and request id.
+func logXAIPromptCacheUsage(ctx context.Context, prepared *xaiPreparedRequest, auth *cliproxyauth.Auth, detail usage.Detail) {
+	if prepared == nil || detail.InputTokens <= 0 {
+		return
+	}
+	authLabel := ""
+	if auth != nil {
+		authLabel = auth.Label
+		if authLabel == "" {
+			authLabel = auth.ID
+		}
+	}
+	hitRatio := float64(detail.CachedTokens) / float64(detail.InputTokens) * 100
+	helps.LogWithRequestID(ctx).Infof("xai: prompt-cache | session=%s auth=%s model=%s input=%d cached=%d hit=%.1f%%",
+		truncateXAIDiagnosticValue(prepared.replayScope.sessionKey), authLabel, prepared.baseModel,
+		detail.InputTokens, detail.CachedTokens, hitRatio)
+}
+
+func xaiPrefixReuseRatio(reused, total int) float64 {
+	if total <= 0 {
+		return 0
+	}
+	return float64(reused) / float64(total) * 100
+}
+
+// truncateXAIDiagnosticValue shortens an identifier for logs while keeping
+// enough of it to tell two values apart across consecutive turns.
+func truncateXAIDiagnosticValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	if len(value) <= 20 {
+		return value
+	}
+	return value[:16] + "..."
 }
 
 func xaiCreds(auth *cliproxyauth.Auth) (token, baseURL string) {

@@ -310,6 +310,11 @@ xai:
   # When true, inject the native x_search tool when the request does not declare it.
   # The injected tool is also added to tool_choice.allowed_tools when applicable.
   inject-x-search: false
+  # When true, log how much of the upstream prompt prefix each request reuses from
+  # the previous turn of the same session, and the first item where it diverges.
+  # Use this to diagnose a low upstream prompt-cache hit rate. Off by default
+  # because building the prefix chain hashes every input item on every request.
+  prefix-diagnostics: false
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true

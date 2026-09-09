@@ -49,6 +49,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 	}
 	applyXAIChatHeaders(httpReq, auth, token, true, prepared.sessionID, opts.Headers)
 	e.recordXAIRequest(ctx, auth, url, httpReq.Header.Clone(), prepared.body)
+	e.diagnoseXAIPrefix(ctx, prepared, prepared.body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
@@ -102,6 +103,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		case "response.completed", "response.incomplete":
 			if detail, ok := helps.ParseCodexUsage(eventData); ok {
 				reporter.Publish(ctx, detail)
+				logXAIPromptCacheUsage(ctx, prepared, auth, detail)
 			}
 			completedData := xaiPatchCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 			completedData = xaiNormalizeReasoningSummaryData(completedData)
@@ -202,7 +204,9 @@ func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxya
 		return nil, nil, nil, err
 	}
 
-	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
+	compactUsage := helps.ParseOpenAIUsage(data)
+	reporter.Publish(ctx, compactUsage)
+	logXAIPromptCacheUsage(ctx, prepared, auth, compactUsage)
 	reporter.EnsurePublished(ctx)
 	clearXAIReasoningReplayAfterCompaction(ctx, prepared.replayScope)
 	return prepared, data, httpResp.Header.Clone(), nil

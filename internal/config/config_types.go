@@ -135,6 +135,11 @@ type CodexHeaderDefaults struct {
 type XAIConfig struct {
 	// InjectXSearch injects xAI's native x_search tool when the request does not declare it.
 	InjectXSearch bool `yaml:"inject-x-search" json:"inject-x-search"`
+
+	// PrefixDiagnostics logs how much of the upstream prompt prefix each request
+	// reuses from the previous turn of the same session, and where it diverges.
+	// Off by default: building the prefix chain hashes every input item.
+	PrefixDiagnostics bool `yaml:"prefix-diagnostics" json:"prefix-diagnostics"`
 }
 
 // AntigravityConfig configures provider-wide Antigravity request behavior.
