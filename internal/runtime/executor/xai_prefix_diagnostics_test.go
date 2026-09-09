@@ -40,11 +40,13 @@ func newXAIDiagPrepared(sessionKey string) *xaiPreparedRequest {
 	}
 }
 
+// Diagnostics run at the default Info level: enabling xai.prefix-diagnostics
+// must be enough on its own, without also switching the server to debug.
 func captureXAIDiagLogs(t *testing.T) *test.Hook {
 	t.Helper()
 	hook := test.NewGlobal()
 	previousLevel := log.GetLevel()
-	log.SetLevel(log.DebugLevel)
+	log.SetLevel(log.InfoLevel)
 	t.Cleanup(func() {
 		log.SetLevel(previousLevel)
 		hook.Reset()
@@ -128,16 +130,36 @@ func TestDiagnoseXAIPrefixAppendOnlyTurnIsNotDrift(t *testing.T) {
 	}
 }
 
-func TestDiagnoseXAIPrefixSkipsInvalidScopeAndBody(t *testing.T) {
+// An empty replay scope is normal for callers without a downstream API key.
+// Diagnostics must fall back to the upstream cache key rather than go silent.
+func TestDiagnoseXAIPrefixFallsBackWhenReplayScopeIsEmpty(t *testing.T) {
 	hook := captureXAIDiagLogs(t)
 	exec := newXAIDiagExecutor(true)
 
 	exec.diagnoseXAIPrefix(context.Background(), newXAIDiagPrepared(""), xaiDiagAuth, []byte(xaiDiagTurnOne))
+
+	msg, ok := xaiDiagFindMessage(hook, "xai: prefix baseline")
+	if !ok {
+		t.Fatalf("expected diagnostics to fall back to prompt_cache_key, got %v", hook.AllEntries())
+	}
+	if !strings.Contains(msg, "session=pck:session-abc") {
+		t.Fatalf("baseline line %q should key off the upstream cache key", msg)
+	}
+}
+
+func TestDiagnoseXAIPrefixSkipsUnusableRequests(t *testing.T) {
+	hook := captureXAIDiagLogs(t)
+	exec := newXAIDiagExecutor(true)
+
 	exec.diagnoseXAIPrefix(context.Background(), nil, xaiDiagAuth, []byte(xaiDiagTurnOne))
+	// No input array: nothing to build a prefix chain from.
 	exec.diagnoseXAIPrefix(context.Background(), newXAIDiagPrepared("caller:aa:pck:skip"), xaiDiagAuth, []byte(`{"input":"not-an-array"}`))
+	// Neither a replay scope nor an upstream cache key: no continuity to track.
+	exec.diagnoseXAIPrefix(context.Background(), newXAIDiagPrepared(""), xaiDiagAuth,
+		[]byte(`{"model":"grok-4.6","instructions":"sys","tools":[],"input":[{"type":"message","role":"user","content":"hi"}]}`))
 
 	if msg, ok := xaiDiagFindMessage(hook, "xai: prefix"); ok {
-		t.Fatalf("expected no diagnostics for an unusable scope or body, got %q", msg)
+		t.Fatalf("expected no diagnostics for an unusable request, got %q", msg)
 	}
 }
 

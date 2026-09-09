@@ -185,27 +185,34 @@ func (e *XAIExecutor) diagnoseXAIPrefix(ctx context.Context, prepared *xaiPrepar
 	if e.cfg == nil || !e.cfg.XAI.PrefixDiagnostics || prepared == nil {
 		return
 	}
-	scope := prepared.replayScope
-	if !scope.valid() {
-		return
-	}
 	chain := helps.BuildResponsesPrefixChain(body)
 	if chain.Len() == 0 {
 		return
 	}
 	chain.AuthID = xaiAuthIdentity(auth)
+	// Deliberately independent of the replay scope's validity: that scope is
+	// empty for callers without a downstream API key and for source formats that
+	// do not replay reasoning, and diagnostics must not go silent there.
+	model := prepared.baseModel
+	sessionKey := xaiDiagnosticSessionKey(prepared, chain.PromptCacheKey)
+	if model == "" || sessionKey == "" {
+		return
+	}
 
 	// The upstream prompt_cache_key is logged on every line: when it rotates
 	// turn to turn, the provider caches under a fresh namespace and no amount of
 	// prefix stability on our side can produce a hit.
-	session := truncateXAIDiagnosticValue(scope.sessionKey)
+	session := truncateXAIDiagnosticValue(sessionKey)
 	promptCacheKey := truncateXAIDiagnosticValue(chain.PromptCacheKey)
 
-	previous, idle, ok := internalcache.LoadXAIPrefixChain(scope.modelName, scope.sessionKey)
-	internalcache.StoreXAIPrefixChain(scope.modelName, scope.sessionKey, chain)
+	previous, idle, ok := internalcache.LoadXAIPrefixChain(model, sessionKey)
+	internalcache.StoreXAIPrefixChain(model, sessionKey, chain)
 	if !ok {
-		helps.LogWithRequestID(ctx).Debugf("xai: prefix baseline | session=%s pck=%s model=%s auth=%s segments=%d",
-			session, promptCacheKey, scope.modelName, chain.AuthID, chain.Len())
+		// Cold by definition: a new conversation, or a sub-agent that carries its
+		// own cache key. Logged at the same level as the problem cases so a low
+		// hit rate on this request can be told apart from a broken continuation.
+		helps.LogWithRequestID(ctx).Infof("xai: prefix baseline | session=%s pck=%s model=%s auth=%s segments=%d",
+			session, promptCacheKey, model, chain.AuthID, chain.Len())
 		return
 	}
 
@@ -213,9 +220,9 @@ func (e *XAIExecutor) diagnoseXAIPrefix(ctx context.Context, prepared *xaiPrepar
 	reuseRatio := xaiPrefixReuseRatio(reused, chain.Len())
 	reason := helps.ClassifyPrefixDrift(previous, chain, reused)
 	if reason == helps.PrefixDriftNone {
-		helps.LogWithRequestID(ctx).Debugf(
+		helps.LogWithRequestID(ctx).Infof(
 			"xai: prefix extended | session=%s pck=%s model=%s auth=%s idle=%s reused=%d/%d (%.1f%%)",
-			session, promptCacheKey, scope.modelName, chain.AuthID, idle.Round(time.Second),
+			session, promptCacheKey, model, chain.AuthID, idle.Round(time.Second),
 			reused, chain.Len(), reuseRatio)
 		return
 	}
@@ -233,20 +240,40 @@ func (e *XAIExecutor) diagnoseXAIPrefix(ctx context.Context, prepared *xaiPrepar
 		}
 		entry.Infof(
 			"xai: prefix cold | session=%s pck=%s model=%s auth=%s idle=%s reused=%d/%d (%.1f%%) reason=%s",
-			session, promptCacheKey, scope.modelName, chain.AuthID, idle.Round(time.Second),
+			session, promptCacheKey, model, chain.AuthID, idle.Round(time.Second),
 			reused, chain.Len(), reuseRatio, reason)
 		return
 	}
 
 	helps.LogWithRequestID(ctx).Infof(
 		"xai: prefix drift | session=%s pck=%s model=%s auth=%s idle=%s reused=%d/%d (%.1f%%) first_divergence=%s prev=%s now=%s reason=%s",
-		session, promptCacheKey, scope.modelName, chain.AuthID, idle.Round(time.Second),
+		session, promptCacheKey, model, chain.AuthID, idle.Round(time.Second),
 		reused, chain.Len(), reuseRatio,
 		helps.PrefixSegmentLabel(chain, reused),
 		helps.PrefixSegmentKind(previous, reused),
 		helps.PrefixSegmentKind(chain, reused),
 		reason,
 	)
+}
+
+// xaiDiagnosticSessionKey picks the continuity key for prefix diagnostics.
+//
+// The reasoning replay scope key is preferred: it is namespaced per caller and
+// survives a prompt_cache_key rotation, which is itself a cause worth naming.
+// It is empty for unauthenticated callers, so fall back to the upstream cache
+// key. The chain stores only hashes and segment labels, so the per-caller
+// isolation the replay cache needs does not apply here.
+func xaiDiagnosticSessionKey(prepared *xaiPreparedRequest, promptCacheKey string) string {
+	if prepared == nil {
+		return ""
+	}
+	if key := strings.TrimSpace(prepared.replayScope.sessionKey); key != "" {
+		return key
+	}
+	if key := strings.TrimSpace(promptCacheKey); key != "" {
+		return "pck:" + key
+	}
+	return ""
 }
 
 // xaiAuthIdentity names the credential a request was sent on, for diagnostics.
@@ -271,8 +298,9 @@ func logXAIPromptCacheUsage(ctx context.Context, prepared *xaiPreparedRequest, a
 		return
 	}
 	hitRatio := float64(detail.CachedTokens) / float64(detail.InputTokens) * 100
+	sessionKey := xaiDiagnosticSessionKey(prepared, gjson.GetBytes(prepared.body, "prompt_cache_key").String())
 	helps.LogWithRequestID(ctx).Infof("xai: prompt-cache | session=%s auth=%s model=%s input=%d cached=%d hit=%.1f%%",
-		truncateXAIDiagnosticValue(prepared.replayScope.sessionKey), xaiAuthIdentity(auth), prepared.baseModel,
+		truncateXAIDiagnosticValue(sessionKey), xaiAuthIdentity(auth), prepared.baseModel,
 		detail.InputTokens, detail.CachedTokens, hitRatio)
 }
 
