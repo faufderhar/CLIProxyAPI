@@ -38,6 +38,10 @@ type XAIPrefixChain struct {
 	Kinds []string
 	// PromptCacheKey is the upstream prompt_cache_key carried by the same body.
 	PromptCacheKey string
+	// AuthID identifies the credential this turn was sent on. The upstream
+	// prompt cache is scoped per account, so a switch makes the cache cold even
+	// when every hashed segment is identical.
+	AuthID string
 }
 
 // Len reports the number of prefix segments.
@@ -70,24 +74,30 @@ func xaiPrefixChainCacheKey(modelName, sessionKey string) string {
 }
 
 // LoadXAIPrefixChain returns the chain stored for the previous turn of this
-// session, if one is still live.
-func LoadXAIPrefixChain(modelName, sessionKey string) (XAIPrefixChain, bool) {
+// session together with how long ago that turn ran. The idle gap matters because
+// the upstream prompt cache expires on its own: a long pause produces a cold
+// cache even when this proxy sends a byte-identical prefix.
+func LoadXAIPrefixChain(modelName, sessionKey string) (XAIPrefixChain, time.Duration, bool) {
 	key := xaiPrefixChainCacheKey(modelName, sessionKey)
 	if key == "" {
-		return XAIPrefixChain{}, false
+		return XAIPrefixChain{}, 0, false
 	}
 	now := xaiPrefixChainNow()
 	xaiPrefixChainMu.Lock()
 	defer xaiPrefixChainMu.Unlock()
 	entry, ok := xaiPrefixChainEntries[key]
 	if !ok {
-		return XAIPrefixChain{}, false
+		return XAIPrefixChain{}, 0, false
 	}
-	if now.Sub(entry.Timestamp) > XAIPrefixChainCacheTTL {
+	idle := now.Sub(entry.Timestamp)
+	if idle > XAIPrefixChainCacheTTL {
 		delete(xaiPrefixChainEntries, key)
-		return XAIPrefixChain{}, false
+		return XAIPrefixChain{}, 0, false
 	}
-	return entry.Chain, true
+	if idle < 0 {
+		idle = 0
+	}
+	return entry.Chain, idle, true
 }
 
 // StoreXAIPrefixChain records this turn's chain as the baseline for the next one.

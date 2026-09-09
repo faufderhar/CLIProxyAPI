@@ -22,6 +22,8 @@ const xaiDiagTurnTwo = `{"model":"grok-4.6","prompt_cache_key":"session-abc","in
 	`"input":[{"type":"message","role":"user","content":"hi"},` +
 	`{"type":"function_call_output","call_id":"c1","output":"ok"}]}`
 
+var xaiDiagAuth = &cliproxyauth.Auth{ID: "auth-a", Label: "xai-a.json"}
+
 func newXAIDiagExecutor(enabled bool) *XAIExecutor {
 	cfg := &config.Config{}
 	cfg.XAI.PrefixDiagnostics = enabled
@@ -64,8 +66,8 @@ func TestDiagnoseXAIPrefixDisabledByDefault(t *testing.T) {
 	exec := newXAIDiagExecutor(false)
 	prepared := newXAIDiagPrepared("caller:aa:pck:disabled")
 
-	exec.diagnoseXAIPrefix(context.Background(), prepared, []byte(xaiDiagTurnOne))
-	exec.diagnoseXAIPrefix(context.Background(), prepared, []byte(xaiDiagTurnTwo))
+	exec.diagnoseXAIPrefix(context.Background(), prepared, xaiDiagAuth, []byte(xaiDiagTurnOne))
+	exec.diagnoseXAIPrefix(context.Background(), prepared, xaiDiagAuth, []byte(xaiDiagTurnTwo))
 
 	if msg, ok := xaiDiagFindMessage(hook, "xai: prefix"); ok {
 		t.Fatalf("diagnostics must stay silent when the flag is off, got %q", msg)
@@ -77,13 +79,13 @@ func TestDiagnoseXAIPrefixReportsDriftBetweenTurns(t *testing.T) {
 	exec := newXAIDiagExecutor(true)
 	prepared := newXAIDiagPrepared("caller:aa:pck:drift")
 
-	exec.diagnoseXAIPrefix(context.Background(), prepared, []byte(xaiDiagTurnOne))
+	exec.diagnoseXAIPrefix(context.Background(), prepared, xaiDiagAuth, []byte(xaiDiagTurnOne))
 	if _, ok := xaiDiagFindMessage(hook, "xai: prefix baseline"); !ok {
 		t.Fatal("the first turn of a session should log a baseline")
 	}
 	hook.Reset()
 
-	exec.diagnoseXAIPrefix(context.Background(), prepared, []byte(xaiDiagTurnTwo))
+	exec.diagnoseXAIPrefix(context.Background(), prepared, xaiDiagAuth, []byte(xaiDiagTurnTwo))
 	msg, ok := xaiDiagFindMessage(hook, "xai: prefix drift")
 	if !ok {
 		t.Fatalf("expected a drift line, got %v", hook.AllEntries())
@@ -106,13 +108,13 @@ func TestDiagnoseXAIPrefixAppendOnlyTurnIsNotDrift(t *testing.T) {
 	exec := newXAIDiagExecutor(true)
 	prepared := newXAIDiagPrepared("caller:aa:pck:append")
 
-	exec.diagnoseXAIPrefix(context.Background(), prepared, []byte(xaiDiagTurnOne))
+	exec.diagnoseXAIPrefix(context.Background(), prepared, xaiDiagAuth, []byte(xaiDiagTurnOne))
 	hook.Reset()
 
 	appended := strings.Replace(xaiDiagTurnOne,
 		`{"type":"function_call_output","call_id":"c1","output":"ok"}]}`,
 		`{"type":"function_call_output","call_id":"c1","output":"ok"},{"type":"message","role":"user","content":"more"}]}`, 1)
-	exec.diagnoseXAIPrefix(context.Background(), prepared, []byte(appended))
+	exec.diagnoseXAIPrefix(context.Background(), prepared, xaiDiagAuth, []byte(appended))
 
 	if msg, ok := xaiDiagFindMessage(hook, "xai: prefix drift"); ok {
 		t.Fatalf("an append-only turn must not report drift, got %q", msg)
@@ -130,9 +132,9 @@ func TestDiagnoseXAIPrefixSkipsInvalidScopeAndBody(t *testing.T) {
 	hook := captureXAIDiagLogs(t)
 	exec := newXAIDiagExecutor(true)
 
-	exec.diagnoseXAIPrefix(context.Background(), newXAIDiagPrepared(""), []byte(xaiDiagTurnOne))
-	exec.diagnoseXAIPrefix(context.Background(), nil, []byte(xaiDiagTurnOne))
-	exec.diagnoseXAIPrefix(context.Background(), newXAIDiagPrepared("caller:aa:pck:skip"), []byte(`{"input":"not-an-array"}`))
+	exec.diagnoseXAIPrefix(context.Background(), newXAIDiagPrepared(""), xaiDiagAuth, []byte(xaiDiagTurnOne))
+	exec.diagnoseXAIPrefix(context.Background(), nil, xaiDiagAuth, []byte(xaiDiagTurnOne))
+	exec.diagnoseXAIPrefix(context.Background(), newXAIDiagPrepared("caller:aa:pck:skip"), xaiDiagAuth, []byte(`{"input":"not-an-array"}`))
 
 	if msg, ok := xaiDiagFindMessage(hook, "xai: prefix"); ok {
 		t.Fatalf("expected no diagnostics for an unusable scope or body, got %q", msg)
@@ -209,5 +211,74 @@ func TestLogXAIPromptCacheUsageFallsBackToAuthID(t *testing.T) {
 	}
 	if !strings.Contains(msg, "auth=auth-id") || !strings.Contains(msg, "hit=0.0%") {
 		t.Fatalf("prompt-cache line %q should fall back to the auth id and report a zero hit rate", msg)
+	}
+}
+
+// The 128-cached-token symptom: a byte-identical prefix that still reads cold
+// because the turn landed on a different credential. Prefix comparison alone
+// cannot see this, so the classifier must report it from the auth identity.
+func TestDiagnoseXAIPrefixReportsCredentialSwitchOnIdenticalPrefix(t *testing.T) {
+	hook := captureXAIDiagLogs(t)
+	exec := newXAIDiagExecutor(true)
+	prepared := newXAIDiagPrepared("caller:aa:pck:authswitch")
+
+	exec.diagnoseXAIPrefix(context.Background(), prepared, xaiDiagAuth, []byte(xaiDiagTurnOne))
+	hook.Reset()
+
+	other := &cliproxyauth.Auth{ID: "auth-b", Label: "xai-b.json"}
+	exec.diagnoseXAIPrefix(context.Background(), prepared, other, []byte(xaiDiagTurnOne))
+
+	msg, ok := xaiDiagFindMessage(hook, "xai: prefix cold")
+	if !ok {
+		t.Fatalf("a credential switch must be reported even with an identical prefix, got %v", hook.AllEntries())
+	}
+	if strings.Contains(msg, "first_divergence") {
+		t.Fatalf("a namespace change has no divergence position to report: %q", msg)
+	}
+	for _, want := range []string{"reused=5/5", "auth=xai-b.json", "reason=auth_switched"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("drift line %q is missing %q", msg, want)
+		}
+	}
+	entry := xaiDiagFindEntry(t, hook, "xai: prefix cold")
+	if got := entry.Data["prev_auth"]; got != "xai-a.json" {
+		t.Fatalf("prev_auth field = %v, want xai-a.json", got)
+	}
+}
+
+func xaiDiagFindEntry(t *testing.T, hook *test.Hook, substring string) *log.Entry {
+	t.Helper()
+	for _, entry := range hook.AllEntries() {
+		if strings.Contains(entry.Message, substring) {
+			return entry
+		}
+	}
+	t.Fatalf("no log entry containing %q", substring)
+	return nil
+}
+
+// A rotated prompt_cache_key is the other way to get a cold read with a fully
+// reused prefix: the provider caches under a fresh namespace.
+func TestDiagnoseXAIPrefixReportsRotatedPromptCacheKey(t *testing.T) {
+	hook := captureXAIDiagLogs(t)
+	exec := newXAIDiagExecutor(true)
+	prepared := newXAIDiagPrepared("caller:aa:pck:rotate")
+
+	exec.diagnoseXAIPrefix(context.Background(), prepared, xaiDiagAuth, []byte(xaiDiagTurnOne))
+	hook.Reset()
+
+	rotated := strings.Replace(xaiDiagTurnOne, `"prompt_cache_key":"session-abc"`, `"prompt_cache_key":"session-xyz"`, 1)
+	exec.diagnoseXAIPrefix(context.Background(), prepared, xaiDiagAuth, []byte(rotated))
+
+	msg, ok := xaiDiagFindMessage(hook, "xai: prefix cold")
+	if !ok {
+		t.Fatalf("expected a cold line, got %v", hook.AllEntries())
+	}
+	if !strings.Contains(msg, "reason=session_key_changed") || !strings.Contains(msg, "reused=5/5") {
+		t.Fatalf("cold line %q should report a rotated key over a fully reused prefix", msg)
+	}
+	entry := xaiDiagFindEntry(t, hook, "xai: prefix cold")
+	if got := entry.Data["prev_pck"]; got != "session-abc" {
+		t.Fatalf("prev_pck field = %v, want session-abc", got)
 	}
 }

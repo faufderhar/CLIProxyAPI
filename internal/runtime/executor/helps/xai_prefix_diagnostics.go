@@ -25,6 +25,7 @@ const (
 	PrefixDriftEncryptedStripped   = "encrypted_content_stripped"
 	PrefixDriftHistoryRewritten    = "history_rewritten"
 	PrefixDriftSessionKeyChanged   = "session_key_changed"
+	PrefixDriftAuthSwitched        = "auth_switched"
 	PrefixDriftUnknown             = "unknown"
 )
 
@@ -93,9 +94,17 @@ func ComparePrefixChains(previous, next internalcache.XAIPrefixChain) int {
 	return reused
 }
 
-// ClassifyPrefixDrift names the most likely cause of a divergence at index
-// firstDivergence. It reports PrefixDriftNone when next simply extends previous.
+// ClassifyPrefixDrift names the most likely cause of a cache miss between two
+// consecutive turns. A change of credential or prompt_cache_key is reported even
+// when the hashed prefix is identical, because either one makes the upstream
+// cache cold on its own. It reports PrefixDriftNone when next simply extends
+// previous on the same account and cache key.
 func ClassifyPrefixDrift(previous, next internalcache.XAIPrefixChain, firstDivergence int) string {
+	// Namespace changes outrank positional ones: when the account or the cache
+	// key changes the upstream cache is cold no matter how stable the prefix is.
+	if previous.AuthID != next.AuthID {
+		return PrefixDriftAuthSwitched
+	}
 	if previous.PromptCacheKey != next.PromptCacheKey {
 		return PrefixDriftSessionKeyChanged
 	}

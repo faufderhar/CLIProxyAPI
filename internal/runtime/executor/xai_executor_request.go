@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
@@ -175,7 +176,12 @@ func (e *XAIExecutor) recordXAIRequest(ctx context.Context, auth *cliproxyauth.A
 // reuses from the previous turn of the same session, and the first segment where
 // it diverges. Gated on xai.prefix-diagnostics because the chain hashes every
 // input item on every request.
-func (e *XAIExecutor) diagnoseXAIPrefix(ctx context.Context, prepared *xaiPreparedRequest, body []byte) {
+//
+// It also reports the credential and the idle gap since the previous turn. Those
+// two cover the cache misses a prefix comparison cannot see on its own: the
+// upstream cache is scoped per account and expires by itself, so a byte-identical
+// prefix still reads cold after a credential switch or a long pause.
+func (e *XAIExecutor) diagnoseXAIPrefix(ctx context.Context, prepared *xaiPreparedRequest, auth *cliproxyauth.Auth, body []byte) {
 	if e.cfg == nil || !e.cfg.XAI.PrefixDiagnostics || prepared == nil {
 		return
 	}
@@ -187,37 +193,74 @@ func (e *XAIExecutor) diagnoseXAIPrefix(ctx context.Context, prepared *xaiPrepar
 	if chain.Len() == 0 {
 		return
 	}
+	chain.AuthID = xaiAuthIdentity(auth)
+
 	// The upstream prompt_cache_key is logged on every line: when it rotates
 	// turn to turn, the provider caches under a fresh namespace and no amount of
 	// prefix stability on our side can produce a hit.
 	session := truncateXAIDiagnosticValue(scope.sessionKey)
 	promptCacheKey := truncateXAIDiagnosticValue(chain.PromptCacheKey)
 
-	previous, ok := internalcache.LoadXAIPrefixChain(scope.modelName, scope.sessionKey)
+	previous, idle, ok := internalcache.LoadXAIPrefixChain(scope.modelName, scope.sessionKey)
 	internalcache.StoreXAIPrefixChain(scope.modelName, scope.sessionKey, chain)
 	if !ok {
-		helps.LogWithRequestID(ctx).Debugf("xai: prefix baseline | session=%s pck=%s model=%s segments=%d",
-			session, promptCacheKey, scope.modelName, chain.Len())
+		helps.LogWithRequestID(ctx).Debugf("xai: prefix baseline | session=%s pck=%s model=%s auth=%s segments=%d",
+			session, promptCacheKey, scope.modelName, chain.AuthID, chain.Len())
 		return
 	}
 
 	reused := helps.ComparePrefixChains(previous, chain)
 	reuseRatio := xaiPrefixReuseRatio(reused, chain.Len())
-	if reused >= previous.Len() {
-		helps.LogWithRequestID(ctx).Debugf("xai: prefix extended | session=%s pck=%s model=%s reused=%d/%d (%.1f%%)",
-			session, promptCacheKey, scope.modelName, reused, chain.Len(), reuseRatio)
+	reason := helps.ClassifyPrefixDrift(previous, chain, reused)
+	if reason == helps.PrefixDriftNone {
+		helps.LogWithRequestID(ctx).Debugf(
+			"xai: prefix extended | session=%s pck=%s model=%s auth=%s idle=%s reused=%d/%d (%.1f%%)",
+			session, promptCacheKey, scope.modelName, chain.AuthID, idle.Round(time.Second),
+			reused, chain.Len(), reuseRatio)
 		return
 	}
 
-	reason := helps.ClassifyPrefixDrift(previous, chain, reused)
+	// A namespace change has no divergence position to report: the prefix can be
+	// a perfect match and the upstream cache still reads cold, because the
+	// previous turn warmed a different account or a different cache key.
+	if reason == helps.PrefixDriftAuthSwitched || reason == helps.PrefixDriftSessionKeyChanged {
+		entry := helps.LogWithRequestID(ctx)
+		if previous.AuthID != chain.AuthID {
+			entry = entry.WithField("prev_auth", previous.AuthID)
+		}
+		if previous.PromptCacheKey != chain.PromptCacheKey {
+			entry = entry.WithField("prev_pck", truncateXAIDiagnosticValue(previous.PromptCacheKey))
+		}
+		entry.Infof(
+			"xai: prefix cold | session=%s pck=%s model=%s auth=%s idle=%s reused=%d/%d (%.1f%%) reason=%s",
+			session, promptCacheKey, scope.modelName, chain.AuthID, idle.Round(time.Second),
+			reused, chain.Len(), reuseRatio, reason)
+		return
+	}
+
 	helps.LogWithRequestID(ctx).Infof(
-		"xai: prefix drift | session=%s pck=%s model=%s reused=%d/%d (%.1f%%) first_divergence=%s prev=%s now=%s reason=%s",
-		session, promptCacheKey, scope.modelName, reused, chain.Len(), reuseRatio,
+		"xai: prefix drift | session=%s pck=%s model=%s auth=%s idle=%s reused=%d/%d (%.1f%%) first_divergence=%s prev=%s now=%s reason=%s",
+		session, promptCacheKey, scope.modelName, chain.AuthID, idle.Round(time.Second),
+		reused, chain.Len(), reuseRatio,
 		helps.PrefixSegmentLabel(chain, reused),
 		helps.PrefixSegmentKind(previous, reused),
 		helps.PrefixSegmentKind(chain, reused),
 		reason,
 	)
+}
+
+// xaiAuthIdentity names the credential a request was sent on, for diagnostics.
+func xaiAuthIdentity(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return "-"
+	}
+	if label := strings.TrimSpace(auth.Label); label != "" {
+		return label
+	}
+	if id := strings.TrimSpace(auth.ID); id != "" {
+		return id
+	}
+	return "-"
 }
 
 // logXAIPromptCacheUsage reports the upstream prompt-cache hit rate for one
@@ -227,16 +270,9 @@ func logXAIPromptCacheUsage(ctx context.Context, prepared *xaiPreparedRequest, a
 	if prepared == nil || detail.InputTokens <= 0 {
 		return
 	}
-	authLabel := ""
-	if auth != nil {
-		authLabel = auth.Label
-		if authLabel == "" {
-			authLabel = auth.ID
-		}
-	}
 	hitRatio := float64(detail.CachedTokens) / float64(detail.InputTokens) * 100
 	helps.LogWithRequestID(ctx).Infof("xai: prompt-cache | session=%s auth=%s model=%s input=%d cached=%d hit=%.1f%%",
-		truncateXAIDiagnosticValue(prepared.replayScope.sessionKey), authLabel, prepared.baseModel,
+		truncateXAIDiagnosticValue(prepared.replayScope.sessionKey), xaiAuthIdentity(auth), prepared.baseModel,
 		detail.InputTokens, detail.CachedTokens, hitRatio)
 }
 

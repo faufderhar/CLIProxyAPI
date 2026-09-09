@@ -34,7 +34,7 @@ func TestXAIPrefixChainRoundTrip(t *testing.T) {
 	want := sampleXAIPrefixChain("a", "b", "c")
 	StoreXAIPrefixChain("grok-4.6", "sess-1", want)
 
-	got, ok := LoadXAIPrefixChain("grok-4.6", "sess-1")
+	got, _, ok := LoadXAIPrefixChain("grok-4.6", "sess-1")
 	if !ok {
 		t.Fatal("LoadXAIPrefixChain reported a miss for a freshly stored chain")
 	}
@@ -55,10 +55,10 @@ func TestXAIPrefixChainIsolatedByModelAndSession(t *testing.T) {
 	resetXAIPrefixChainCache(t)
 	StoreXAIPrefixChain("grok-4.6", "sess-1", sampleXAIPrefixChain("a"))
 
-	if _, ok := LoadXAIPrefixChain("grok-4.6", "sess-2"); ok {
+	if _, _, ok := LoadXAIPrefixChain("grok-4.6", "sess-2"); ok {
 		t.Fatal("a different session must not read another session's chain")
 	}
-	if _, ok := LoadXAIPrefixChain("grok-4.6-fast", "sess-1"); ok {
+	if _, _, ok := LoadXAIPrefixChain("grok-4.6-fast", "sess-1"); ok {
 		t.Fatal("a different model must not read another model's chain")
 	}
 }
@@ -70,7 +70,7 @@ func TestXAIPrefixChainRejectsEmptyKeyParts(t *testing.T) {
 	// An empty chain carries no baseline and must not evict a real one.
 	StoreXAIPrefixChain("grok-4.6", "sess-1", XAIPrefixChain{})
 
-	if _, ok := LoadXAIPrefixChain("grok-4.6", "sess-1"); ok {
+	if _, _, ok := LoadXAIPrefixChain("grok-4.6", "sess-1"); ok {
 		t.Fatal("expected no entry to be stored")
 	}
 	xaiPrefixChainMu.Lock()
@@ -92,12 +92,12 @@ func TestXAIPrefixChainExpiresAfterTTL(t *testing.T) {
 	StoreXAIPrefixChain("grok-4.6", "sess-1", sampleXAIPrefixChain("a"))
 
 	current = base.Add(XAIPrefixChainCacheTTL)
-	if _, ok := LoadXAIPrefixChain("grok-4.6", "sess-1"); !ok {
+	if _, _, ok := LoadXAIPrefixChain("grok-4.6", "sess-1"); !ok {
 		t.Fatal("entry must survive exactly at the TTL boundary")
 	}
 
 	current = base.Add(XAIPrefixChainCacheTTL + time.Second)
-	if _, ok := LoadXAIPrefixChain("grok-4.6", "sess-1"); ok {
+	if _, _, ok := LoadXAIPrefixChain("grok-4.6", "sess-1"); ok {
 		t.Fatal("entry must be gone past the TTL")
 	}
 	xaiPrefixChainMu.Lock()
@@ -120,10 +120,10 @@ func TestPurgeExpiredXAIPrefixChainCache(t *testing.T) {
 
 	purgeExpiredXAIPrefixChainCache(base.Add(XAIPrefixChainCacheTTL + time.Second))
 
-	if _, ok := LoadXAIPrefixChain("grok-4.6", "old"); ok {
+	if _, _, ok := LoadXAIPrefixChain("grok-4.6", "old"); ok {
 		t.Fatal("expired entry survived the purge")
 	}
-	if _, ok := LoadXAIPrefixChain("grok-4.6", "fresh"); !ok {
+	if _, _, ok := LoadXAIPrefixChain("grok-4.6", "fresh"); !ok {
 		t.Fatal("live entry was purged")
 	}
 }
@@ -147,14 +147,73 @@ func TestXAIPrefixChainEvictsOldestAtCapacity(t *testing.T) {
 	if size != wantSize {
 		t.Fatalf("cache size after eviction = %d, want %d", size, wantSize)
 	}
-	if _, ok := LoadXAIPrefixChain("grok-4.6", sessionName(0)); ok {
+	if _, _, ok := LoadXAIPrefixChain("grok-4.6", sessionName(0)); ok {
 		t.Fatal("the oldest entry should have been evicted first")
 	}
-	if _, ok := LoadXAIPrefixChain("grok-4.6", sessionName(XAIPrefixChainCacheMaxEntries)); !ok {
+	if _, _, ok := LoadXAIPrefixChain("grok-4.6", sessionName(XAIPrefixChainCacheMaxEntries)); !ok {
 		t.Fatal("the newest entry must survive eviction")
 	}
 }
 
 func sessionName(index int) string {
 	return "sess-" + time.Duration(index).String()
+}
+
+// The idle gap is what tells a caller whether a cold read is explained by the
+// upstream cache expiring on its own rather than by anything the proxy changed.
+func TestLoadXAIPrefixChainReportsIdleGap(t *testing.T) {
+	resetXAIPrefixChainCache(t)
+	base := time.Date(2026, 9, 9, 11, 0, 0, 0, time.UTC)
+	current := base
+	xaiPrefixChainNow = func() time.Time { return current }
+
+	StoreXAIPrefixChain("grok-4.6", "sess-1", sampleXAIPrefixChain("a"))
+
+	if _, idle, ok := LoadXAIPrefixChain("grok-4.6", "sess-1"); !ok || idle != 0 {
+		t.Fatalf("immediate read: idle = %s, ok = %v; want 0 and true", idle, ok)
+	}
+
+	current = base.Add(9 * time.Minute)
+	_, idle, ok := LoadXAIPrefixChain("grok-4.6", "sess-1")
+	if !ok {
+		t.Fatal("entry must still be live 9 minutes in")
+	}
+	if idle != 9*time.Minute {
+		t.Fatalf("idle = %s, want 9m0s", idle)
+	}
+}
+
+// A clock that steps backwards (NTP correction, container clock skew) must not
+// produce a negative idle gap in the logs.
+func TestLoadXAIPrefixChainClampsNegativeIdle(t *testing.T) {
+	resetXAIPrefixChainCache(t)
+	base := time.Date(2026, 9, 9, 11, 0, 0, 0, time.UTC)
+	current := base
+	xaiPrefixChainNow = func() time.Time { return current }
+
+	StoreXAIPrefixChain("grok-4.6", "sess-1", sampleXAIPrefixChain("a"))
+	current = base.Add(-2 * time.Second)
+
+	_, idle, ok := LoadXAIPrefixChain("grok-4.6", "sess-1")
+	if !ok {
+		t.Fatal("a backwards clock must not drop the entry")
+	}
+	if idle != 0 {
+		t.Fatalf("idle = %s, want it clamped to 0", idle)
+	}
+}
+
+func TestXAIPrefixChainRetainsAuthID(t *testing.T) {
+	resetXAIPrefixChainCache(t)
+	chain := sampleXAIPrefixChain("a")
+	chain.AuthID = "xai-a.json"
+	StoreXAIPrefixChain("grok-4.6", "sess-1", chain)
+
+	got, _, ok := LoadXAIPrefixChain("grok-4.6", "sess-1")
+	if !ok {
+		t.Fatal("expected a stored chain")
+	}
+	if got.AuthID != "xai-a.json" {
+		t.Fatalf("AuthID = %q, want xai-a.json", got.AuthID)
+	}
 }
